@@ -1,0 +1,376 @@
+---
+title: "8K Topic Modelling"
+author: "Austin Pennington"
+date: "11/24/2018"
+output: html_document
+---
+```{r}
+data_dir <- paste(getwd(), sep = "", "/Data")
+sample_size <- 20
+setwd(data_dir)
+library(R.utils)
+#gunzip("AAON.gz")
+library(readtext)
+
+######################################## Preprocessing ######################################## 
+
+get.8ks.list<-function(dir){
+  #get a list of all files with ndvi in the name in your directory
+  files<-list.files(path=dir, full.names = TRUE)
+  eightK.list<-list()
+  for (file in files){
+    #### Creating document list for section "file"
+    fileName <- file
+    #print(fileName)
+    eightK<-readChar(fileName, file.info(fileName)$size)
+    #eightKs.A.list<-unlist(strsplit(eightKs.A, "<DOCUMENT>"))[2:length(unlist(strsplit(eightKs.A, "*<DOCUMENT>*")))]
+    eightK.lines<-readLines(fileName, file.info(fileName)$size)
+    #Filter out headers
+    eightK.lines<-eightK.lines[-grep("[FILE|TIME|EVENTS|TEXT]{4,6}:.*",eightK.lines)]
+    #Collapse lines into 1 text body
+    eightK.lines<-paste(eightK.lines, collapse = "\n")
+    eightK.list<-c(eightK.list, unlist(strsplit(eightK.lines, "<DOCUMENT>"))[2:length(unlist(strsplit(eightK.lines, "<DOCUMENT>")))])
+  }
+  return(eightK.list)
+}
+
+eightKs.list<-get.8ks.list(data_dir)
+
+#Sample list
+sample.list<-sample(eightKs.list, sample_size)
+
+#### Creating corpus
+#install.packages("tm")
+library(slam)
+library(tm)
+text.corpus <- Corpus(VectorSource(sample.list))
+#text.corpus[1]
+#inspect(text.corpus[1:2])
+
+#### Transformations
+
+#convert to lower case content_transformer(tolower)
+text.corpus <- tm_map(text.corpus,content_transformer(tolower))
+
+#remove numbers
+text.corpus <- tm_map(text.corpus, removeNumbers)
+
+#remove stopwords
+text.corpus <- tm_map(text.corpus, removeWords, stopwords("english"))
+
+#get rid of whitespace
+text.corpus <- tm_map(text.corpus, stripWhitespace)
+
+#remove punctuation
+text.corpus <- tm_map(text.corpus, removePunctuation)
+
+#stem 
+text.corpus <- tm_map(text.corpus, stemDocument, language = "english")  
+
+dtm <- DocumentTermMatrix(text.corpus)
+inspect(dtm)
+head(findMostFreqTerms(dtm))
+findAssocs(dtm, "synergy", 0.8)
+dtm<-removeSparseTerms(dtm, 0.4)
+inspect(dtm)
+findAssocs(dtm, "business", 0.8)
+
+#remove blank rows
+rowTotals <- apply(dtm , 1, sum) #Find the sum of words in each Document
+dtm.new   <- dtm[rowTotals> 0, ]           #remove all docs without words
+
+
+######################################## Topic Preparation ######################################## 
+
+# https://arxiv.org/pdf/1805.03308.pdf
+# Number of Topics = 20, pg. 19
+
+# http://cs229.stanford.edu/proj2013/LeeLee-PredictingCorporate8-KContentUsingMachineLearningTechniques.pdf
+# Number of Topics = 5, pg. 1
+
+
+######################################## Topic Modelling ######################################## 
+
+########## Latent dirichlet allocation ########## 
+
+#install.packages("topicmodels")
+library(topicmodels)
+A.8k.lda <- LDA(dtm.new, k = 5, control = list(seed = 1234))
+#install.packages("tidytext")
+library(tidytext)
+A.8k.topics <- tidy(A.8k.lda, matrix = "beta")
+#install.packages("ggplot2")
+library(ggplot2)
+library(dplyr)
+
+
+#### The terms that are most common within each topic
+A.8k_top_terms <- A.8k.topics %>%
+  group_by(topic) %>%
+  top_n(15) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+A.8k_top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") + ggtitle("LDA") +
+  coord_flip()
+
+#### Words with the greatest difference in β between topic 2 and topic 1
+library(tidyr)
+
+beta_spread <- A.8k.topics %>%
+  mutate(topic = paste0("topic", topic)) %>%
+  spread(topic, beta) %>%
+  filter(topic1 > .001 | topic2 > .001) %>%
+  mutate(log_ratio = log2(topic2 / topic1))
+
+beta_spread
+beta_spread %>%
+  mutate(term = reorder(term, log_ratio)) %>%
+  ggplot(aes(term, log_ratio, fill = factor(term))) +
+  ylab("Log2 ratio of beta in topic2/topic1") +
+  geom_col(show.legend = FALSE) +
+  coord_flip()
+
+#Topic 2 words: operations, results, billion, customer, revenue, fiscal, financial: 
+#  likely financial forms/financial health forms
+#Topic 1 words: executive, written, right, cause, company, provisions, obligation, authorized, pursuant:
+#  likely administrative or legal forms
+
+
+#### per-document-per-topic probabilities
+A.8k.documents <- tidy(A.8k.lda, matrix = "gamma")
+
+A.8k.documents[A.8k.documents$document == 1,] # 25% topic 1, 71% topic 5, 3% topic 2,
+eightKs.list[1] # CEO statements to the SEC
+tidy(dtm) %>%
+  filter(document == 1) %>%
+  arrange(desc(count))
+
+#### Maximum gamma distribution
+gamma.counts <- list(0,0,0,0,0)#of size # of topics
+max.gammas<- c()
+gamma.spread<-spread(A.8k.documents, key = topic, value = gamma)
+gamma.spread<-gamma.spread[,-1]
+for (i in 1:nrow(gamma.spread)){
+  topic<- which.max(unlist(gamma.spread[i,])) #which topic is max gamma
+  max.gammas<-c(max.gammas, max(unlist(gamma.spread[i,])))
+  gamma.counts[[topic]] <- gamma.counts[[topic]] + 1
+}
+
+hist(max.gammas, xlim = c(0,1), main= "Max Gamma Histogram, LDA")
+abline(v = (1/5), col = "red")
+barplot(colSums(gamma.spread), main = "Topic Distribution: LDA")
+
+
+########## Correlated topic models ########## 
+
+A.8k.ctm <- CTM(dtm.new, k = 5, control = list(seed = 1234))
+library(tidytext)
+A.8k.topics.ctm <- tidy(A.8k.ctm, matrix = "beta")
+
+#### The terms that are most common within each topic
+A.8k_top_terms.ctm <- A.8k.topics.ctm %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+A.8k_top_terms.ctm %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") + ggtitle("CTM") +
+  coord_flip()
+
+#### Words with the greatest difference in β between topic 2 and topic 1
+
+beta_spread <- A.8k.topics.ctm %>%
+  mutate(topic = paste0("topic", topic)) %>%
+  spread(topic, beta) %>%
+  filter(topic1 > .001 | topic2 > .001) %>%
+  mutate(log_ratio = log2(topic2 / topic1))
+
+beta_spread
+beta_spread %>%
+  mutate(term = reorder(term, log_ratio)) %>%
+  ggplot(aes(term, log_ratio, fill = factor(term))) +
+  ylab("Log2 ratio of beta in topic2/topic1") +
+  geom_col(show.legend = FALSE) +
+  coord_flip()
+
+#Topic 2 words: section, date, otherwise, written, time, right, cause, provisions:
+# likely legal forms
+#Topic 1 words: billion, net, revenue, fiscal, financial, share
+# likely financial/company health reports
+
+
+#### per-document-per-topic probabilities
+A.8k.documents.ctm <- tidy(A.8k.ctm, matrix = "gamma")
+A.8k.documents.ctm
+
+
+A.8k.documents.ctm[A.8k.documents.ctm$document == 1,] # 52% topic 1, 21% topic 3, 20% topic 5,
+eightKs.list[1] # CEO statements to the SEC
+tidy(dtm) %>%
+  filter(document == 1) %>%
+  arrange(desc(count))
+
+
+#### Maximum gamma distribution CTM
+gamma.counts <- list(0,0,0,0,0)#of size # of topics
+max.gammas<- c()
+gamma.spread<-spread(A.8k.documents.ctm, key = topic, value = gamma)
+gamma.spread<-gamma.spread[,-1]
+for (i in 1:nrow(gamma.spread)){
+  topic<- which.max(unlist(gamma.spread[i,])) #which topic is max gamma
+  max.gammas<-c(max.gammas, max(unlist(gamma.spread[i,])))
+  gamma.counts[[topic]] <- gamma.counts[[topic]] + 1
+}
+
+hist(max.gammas, xlim = c(0,1), main= "Max Gamma Histogram, CTM")
+abline(v = (1/5), col = "red")
+
+barplot(colSums(gamma.spread), main = "Topic Distribution: CTM")
+
+
+########## Non-negative matrix factorization ########## 
+#install.packages("NMF")
+library(NMF)
+
+#### Preprocessing
+
+#extract term document matrix from dtm
+tdm<-as.TermDocumentMatrix(dtm)
+tdm$dimnames$Terms
+tdm.tidy<-tidy(tdm)
+df.tdm<-as.data.frame(tdm.tidy)
+tdm.matrix<-spread(df.tdm, document, count)#convert to data frame from column wise data
+#convert all na to 0, 
+tdm.matrix[is.na(tdm.matrix)] <- 0
+
+#rownames(tdm.matrix)
+rownames(tdm.matrix) <- tdm.matrix[,1]
+tdm.matrix[,1] <- NULL
+
+#### Topic Modelling
+
+res <- nmf(tdm.matrix, 5,"KL") # r = 5 topics
+
+
+w <- basis(res) #  W  user feature matrix matrix
+dim(w)
+df.w <- as.data.frame(w)
+head(df.w,10)
+
+df.w$total <- rowSums(df.w)
+df.w$word<-rownames(df.w)
+colnames(df.w) <- c("doc1","doc2","doc3","doc4","doc5","total","word")
+
+df.w <-df.w[order(-df.w$total),] 
+head(df.w,20)
+
+wordMatrix = as.data.frame(w)
+## normalize cols
+wordMatrix<-sweep(wordMatrix, 2, colSums(wordMatrix), FUN="/")
+scale(wordMatrix, center=FALSE, scale=colSums(wordMatrix))
+## normalize cols/
+wordMatrix$word<-rownames(wordMatrix)
+colnames(wordMatrix) <- c("doc1","doc2","doc3","doc4","doc5","word")
+
+## wordMatrix is the NMF beta matrix
+
+#### Topic 1-5
+plotsNMF<-list()
+for (i in 1:5){
+  newdata <-wordMatrix[order(-eval(parse(text = paste("wordMatrix$doc",i,sep="")))),] 
+  head(newdata)
+  
+  d <- newdata
+  
+  df <- as.data.frame(cbind(d[1:15,]$word, as.numeric(eval(parse(text = paste("d[1:15,]$doc",i,sep="")))) ))
+  colnames(df)<- c("Word","Beta")
+  
+  # for ggplot to understand the order of words, specify factor order
+  df$Beta<-as.numeric(levels(df$Beta))
+  df$Word <- factor(df$Word, levels = df$Word[order(df$Beta)])
+  plotsNMF[[i]]<-(ggplot(df, aes(x=Word, y=Beta)) + 
+    geom_bar(stat="identity", fill="lightgreen", color="grey50") + #scale_y_discrete(breaks=seq(0,.5,by=0.01), limits=c(0,.5)) +
+    coord_flip()+
+    ggtitle(paste("NMF Topic", toString(i), sep=" ")))
+}
+#install.packages("cowplot")
+library(cowplot)
+plot_grid(plotsNMF[[1]], plotsNMF[[2]],plotsNMF[[3]],plotsNMF[[4]],plotsNMF[[5]], labels=c("Topic"), ncol = 3, nrow = 2)
+
+#NMF Gamma estimation
+inspect(dtm)
+dtm.tidy<-tidy(dtm)
+dtm.tidy.mat<-spread(dtm.tidy, key = term, value = count, fill =0)
+dtm.tidy.mat
+dtm.tidy.mat[dtm.tidy.mat$compani == 557,]
+#Now remove 0 rows
+#dtm.tidy.mat$rowTotals<-rowSums(dtm.tidy.mat)
+#dtm.tidy.mat   <- dtm.tidy.mat[rowTotals> 0, ]           #remove all docs without words
+
+#wordMatrix[wordMatrix$word == "act",]$doc1
+
+## Add 5 columns for topic1 gamma to topic5 gamma
+dtm.tidy.mat$topic1 <- rep(0,nrow(dtm.tidy.mat))
+dtm.tidy.mat$topic2 <- rep(0,nrow(dtm.tidy.mat))
+dtm.tidy.mat$topic3 <- rep(0,nrow(dtm.tidy.mat))
+dtm.tidy.mat$topic4 <- rep(0,nrow(dtm.tidy.mat))
+dtm.tidy.mat$topic5 <- rep(0,nrow(dtm.tidy.mat))
+
+for (i in 1:nrow(dtm.tidy.mat)){
+  print(i)
+  for (c in 1:ncol(dtm.tidy.mat)){
+    for (t in 1:5){# number of topics is 5
+      word<-colnames(dtm.tidy.mat[,c])
+      if (word != "topic1" && word != "topic2" && word != "topic3" && word!="topic4" && word != "topic5"){
+        beta<-eval(parse(text = paste("wordMatrix[wordMatrix$word == word,]$doc",t,sep="")))
+        #topic1  = topic1's gamma in dtm.tidy.mat
+        #dtm.tidy.mat$topici <-  dtm.tidy.mat$topici + beta * dtm.tidy.mat[i,c]
+        #print((parse(text = paste("dtm.tidy.mat[",i,",]$topic",t,sep=""))))
+        new_value<-eval(parse(text = paste("dtm.tidy.mat[",i,",]$topic",t,"[[1]]",sep=""))) + ( beta * dtm.tidy.mat[i,c][[1]])
+        #print(paste("Beta",beta,"word",word,"t",t,sep = ","))
+        eval(parse(text = paste("dtm.tidy.mat[",i,",]$topic",t,"<- new_value",sep=""))) 
+      }
+      
+    }
+  }
+}
+
+#eval(parse(text = paste("wordMatrix[wordMatrix$word == word,]$doc",1,sep="")))
+#eval(parse(text = paste("dtm.tidy.mat[",1,",]$topic",2,"[[1]]",sep=""))) + ( 4 * dtm.tidy.mat[1,2][[1]])
+
+topic.matrix<-dtm.tidy.mat[,-(1:(ncol(dtm.tidy.mat) - 5))]
+#colnames(DF)[apply(DF,1,which.max)]
+relprob <- function(x) {x / sum(x)}
+topic.matrix.norm<-topic.matrix
+#relprob(topic.matrix[1,])
+for (r in 1:nrow(topic.matrix)){
+  topic.matrix.norm[r,] <- relprob(topic.matrix[r,])
+}
+#topic.matrix.norm<-apply(topic.matrix, 1, relprob)
+
+#topic.matrix[1,]
+
+gamma.counts.nmf <- list(0,0,0,0,0)#of size # of topics
+max.gammas.nmf<- c()
+#gamma.spread<-spread(A.8k.documents.ctm, key = topic, value = gamma)
+#gamma.spread<-gamma.spread[,-1]
+for (i in 1:nrow(topic.matrix.norm)){
+  topic<- which.max(unlist(topic.matrix.norm[i,])) #which topic is max gamma
+  max.gammas.nmf<-c(max.gammas.nmf, max(unlist(topic.matrix.norm[i,])))
+  gamma.counts.nmf[[topic]] <- gamma.counts.nmf[[topic]] + 1
+}
+
+hist(max.gammas.nmf, xlim = c(0,1), main= "Max Gamma Histogram, NMF")
+abline(v = (1/5), col = "red")
+barplot(colSums(topic.matrix), main = "Topic Distribution: NMF")
+
+```
